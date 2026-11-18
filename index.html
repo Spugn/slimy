@@ -108,7 +108,6 @@
   let stream = null, track = null, video = null, imageCapture = null;
   let msgId = 1, captures = 0;
   let incoming = [];
-  let writeChain = Promise.resolve();
   let manualDisconnect = false;
 
   // ---------------------------------------------------------------- Bluetooth
@@ -175,16 +174,37 @@
     else if (m.t === 'cap') { handleCapture(m); }
   }
 
-  /** Serializes all writes; the phone reassembles chunks in order. */
-  function write(bytes) {
-    writeChain = writeChain.then(async () => {
-      if (!rx) return;
-      try {
-        if (mtu >= 64) await rx.writeValueWithoutResponse(bytes);
-        else await rx.writeValueWithResponse(bytes); // long write when MTU is small
-      } catch (e) { log('Write failed: ' + e.message); throw e; }
-    }).catch(() => {});
-    return writeChain;
+  /**
+   * One write at a time (GATT allows only one in flight). Control packets (heartbeat, hello,
+   * ended) jump ahead of image chunks so a large capture never starves the heartbeat.
+   */
+  const controlQueue = [], dataQueue = [];
+  let pumping = false;
+
+  function write(bytes, priority = false) {
+    return new Promise((resolve) => {
+      (priority ? controlQueue : dataQueue).push({ bytes, resolve });
+      pump();
+    });
+  }
+
+  async function pump() {
+    if (pumping) return;
+    pumping = true;
+    try {
+      while (controlQueue.length || dataQueue.length) {
+        const item = controlQueue.length ? controlQueue.shift() : dataQueue.shift();
+        if (rx) {
+          try {
+            if (mtu >= 64) await rx.writeValueWithoutResponse(item.bytes);
+            else await rx.writeValueWithResponse(item.bytes); // long write when MTU is small
+          } catch (e) { log('Write failed: ' + e.message); }
+        }
+        item.resolve();
+      }
+    } finally {
+      pumping = false;
+    }
   }
 
   function u16(arr, at, v) { arr[at] = v & 0xff; arr[at + 1] = (v >> 8) & 0xff; }
@@ -210,6 +230,7 @@
 
   function captureSize() {
     if (!track) return [0, 0];
+    if (latestFrame) return [latestFrame.displayWidth, latestFrame.displayHeight];
     const s = track.getSettings();
     return [s.width || (video && video.videoWidth) || 0, s.height || (video && video.videoHeight) || 0];
   }
@@ -217,15 +238,17 @@
   function sendHello() {
     const [w, h] = captureSize();
     const p = new Uint8Array(5); p[0] = HELLO; u16(p, 1, w); u16(p, 3, h);
-    write(p);
+    write(p, true);
   }
 
+  let heartbeatQueued = false;
   function sendHeartbeat() {
-    if (!rx) return;
+    if (!rx || heartbeatQueued) return;
     const [w, h] = captureSize();
     const p = new Uint8Array(6); p[0] = HEARTBEAT; p[1] = track && track.readyState === 'live' ? 1 : 0;
     u16(p, 2, w); u16(p, 4, h);
-    write(p);
+    heartbeatQueued = true;
+    write(p, true).then(() => { heartbeatQueued = false; });
   }
 
   // Timers in a worker aren't throttled when this tab is in the background behind the game.
@@ -253,6 +276,7 @@
     video.muted = true; video.playsInline = true; video.srcObject = stream;
     await video.play().catch(() => {});
     imageCapture = ('ImageCapture' in window) ? new ImageCapture(track) : null;
+    startFrameReader();
     const [w, h] = captureSize();
     setStatus($('shareStatus'), `Sharing "${track.label || 'window'}" (${w}×${h})`, 'ok');
     $('step2').classList.add('done');
@@ -263,30 +287,62 @@
 
   function onEnded() {
     log('Shared window closed');
-    write(new Uint8Array([ENDED]));
+    write(new Uint8Array([ENDED]), true);
     cleanupShare();
     setStatus($('shareStatus'), 'The shared window was closed. Slimy stops macros that need it.', 'err');
   }
 
   function stopSharing() {
     if (track) track.stop();
-    write(new Uint8Array([ENDED]));
+    write(new Uint8Array([ENDED]), true);
     cleanupShare();
     setStatus($('shareStatus'), 'Not sharing');
   }
 
   function cleanupShare() {
+    if (frameReader) { frameReader.cancel().catch(() => {}); frameReader = null; }
+    if (latestFrame) { latestFrame.close(); latestFrame = null; }
     track = null; stream = null; imageCapture = null;
     if (video) { video.srcObject = null; video = null; }
     $('step2').classList.remove('done');
     $('shareBtn').textContent = 'Share window';
   }
 
+  /*
+   * Keep the most recent frame. Window capture only produces frames when the window changes, so
+   * waiting for "the next frame" can hang on a static window like Notepad.
+   */
+  let latestFrame = null, frameReader = null;
+  function startFrameReader() {
+    if (!('MediaStreamTrackProcessor' in window)) return;
+    try {
+      frameReader = new MediaStreamTrackProcessor({ track }).readable.getReader();
+    } catch (e) { log('Frame reader unavailable: ' + e.message); return; }
+    const reader = frameReader;
+    (async () => {
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (latestFrame) latestFrame.close();
+          latestFrame = value;
+        }
+      } catch (e) { /* stream ended */ }
+    })();
+  }
+
+  const timeout = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms));
+
+  /** Returns {src, w, h, own}; `own` sources must be closed after drawing. */
   async function grab() {
+    if (latestFrame) return { src: latestFrame, w: latestFrame.displayWidth, h: latestFrame.displayHeight, own: false };
     if (imageCapture) {
-      try { return await imageCapture.grabFrame(); } catch (e) { /* fall back to the video element */ }
+      try {
+        const bmp = await Promise.race([imageCapture.grabFrame(), timeout(700)]);
+        return { src: bmp, w: bmp.width, h: bmp.height, own: true };
+      } catch (e) { /* fall back to the video element */ }
     }
-    if (video && video.videoWidth) return video;
+    if (video && video.videoWidth) return { src: video, w: video.videoWidth, h: video.videoHeight, own: false };
     throw new Error('No frame available yet');
   }
 
@@ -300,7 +356,7 @@
     try {
       if (!track || track.readyState !== 'live') throw new Error('Not sharing a window');
       const frame = await grab();
-      const vw = frame.videoWidth || frame.width, vh = frame.videoHeight || frame.height;
+      const vw = frame.w, vh = frame.h;
       const sx = Math.max(0, Math.min(vw - 1, Math.round(m.x * vw)));
       const sy = Math.max(0, Math.min(vh - 1, Math.round(m.y * vh)));
       const sw = Math.max(1, Math.min(vw - sx, Math.round(m.w * vw)));
@@ -309,10 +365,12 @@
       if (m.mw > 0 && sw > m.mw) { ow = m.mw; oh = Math.max(1, Math.round(sh * m.mw / sw)); }
       work.width = ow; work.height = oh;
       wctx.imageSmoothingQuality = 'high';
-      wctx.drawImage(frame, sx, sy, sw, sh, 0, 0, ow, oh);
-      if (frame.close) frame.close();
+      wctx.filter = m.g ? 'grayscale(1)' : 'none'; // grayscale encodes smaller for OCR
+      wctx.drawImage(frame.src, sx, sy, sw, sh, 0, 0, ow, oh);
+      if (frame.own) frame.src.close();
       const png = m.f === 'png';
-      const blob = await work.convertToBlob(png ? { type: 'image/png' } : { type: 'image/jpeg', quality: 0.85 });
+      const quality = typeof m.q === 'number' ? m.q : 0.85;
+      const blob = await work.convertToBlob(png ? { type: 'image/png' } : { type: 'image/jpeg', quality });
       const img = new Uint8Array(await blob.arrayBuffer());
       u16(header, 2, vw); u16(header, 4, vh);
       u16(header, 6, sx); u16(header, 8, sy); u16(header, 10, sw); u16(header, 12, sh);
@@ -353,7 +411,7 @@
     else connect();
   });
   $('shareBtn').addEventListener('click', share);
-  window.addEventListener('beforeunload', () => { if (track) write(new Uint8Array([ENDED])); });
+  window.addEventListener('beforeunload', () => { if (track) write(new Uint8Array([ENDED]), true); });
 })();
 </script>
 </body>
