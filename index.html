@@ -92,6 +92,9 @@
   const RX_UUID = '7a5e0003-3c1b-4f6d-9b8e-2d5f51494d59'; // page -> phone (write)
   const HELLO = 0x01, HEARTBEAT = 0x02, ENDED = 0x03, CHUNK = 0x10;
   const FMT_JPEG = 1, FMT_PNG = 2, FMT_ERROR = 3;
+  const PROTOCOL_VERSION = 2;
+  const FLAG_LAST = 1, FLAG_FIRST = 2;
+  const WRITE_TIMEOUT_MS = 2000;
 
   const $ = (id) => document.getElementById(id);
   const logEl = $('log');
@@ -141,23 +144,36 @@
 
   async function onDisconnected() {
     rx = tx = null;
+    resetLink();
     $('step1').classList.remove('done');
     $('connectBtn').textContent = 'Connect';
     if (manualDisconnect) { setStatus($('btStatus'), 'Disconnected'); return; }
     setStatus($('btStatus'), 'Connection lost. Reconnecting…', 'err');
     log('Disconnected; retrying');
     for (let i = 0; i < 5 && device && !manualDisconnect; i++) {
-      await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+      // Worker ticks, not setTimeout: a hidden tab throttles timers to once a minute.
+      await waitTicks(2 * (i + 1));
       try { await openGatt(); return; } catch (e) { log('Retry failed: ' + e.message); }
     }
     setStatus($('btStatus'), 'Disconnected. Click Connect to try again.', 'err');
   }
 
+  /** Forgets everything tied to the current link: queued writes, partial messages, the MTU. */
+  function resetLink() {
+    mtu = 23; $('sMtu').textContent = '–';
+    incoming = [];
+    activeCap = null;
+    for (const q of [controlQueue, dataQueue]) { while (q.length) q.shift().resolve(); }
+    heartbeatQueued = false;
+  }
+
   function onNotify(ev) {
     const bytes = new Uint8Array(ev.target.value.buffer.slice(ev.target.value.byteOffset, ev.target.value.byteOffset + ev.target.value.byteLength));
     if (!bytes.length) return;
+    // A new message starts: drop any leftover from one that was cut off part-way.
+    if (bytes[0] & FLAG_FIRST) incoming = [];
     incoming.push(bytes.slice(1));
-    if (bytes[0] & 1) {
+    if (bytes[0] & FLAG_LAST) {
       const total = incoming.reduce((n, p) => n + p.length, 0);
       const all = new Uint8Array(total);
       let pos = 0;
@@ -169,23 +185,46 @@
     }
   }
 
+  /*
+   * The phone sends one capture request at a time, so only the newest request matters. When a
+   * new request (or a cancel) arrives, everything still queued for an older one is dropped;
+   * otherwise a single slow response would delay every response after it.
+   */
+  let activeCap = null;
+
   function handleMessage(m) {
     if (m.t === 'mtu') { mtu = m.v; $('sMtu').textContent = mtu; }
-    else if (m.t === 'cap') { handleCapture(m); }
+    else if (m.t === 'cap') { activeCap = m.id; handleCapture(m); }
+    else if (m.t === 'cancel') { if (activeCap === m.id) { activeCap = null; log('Phone cancelled capture ' + m.id); } }
+    else if (m.t === 'reset') {
+      log('Phone reset the link after lost captures');
+      const keepMtu = mtu;
+      resetLink();
+      mtu = keepMtu; $('sMtu').textContent = mtu;
+      if (track) sendHello();
+    }
   }
 
   /**
    * One write at a time (GATT allows only one in flight). Control packets (heartbeat, hello,
    * ended) jump ahead of image chunks so a large capture never starves the heartbeat.
+   * Data items carry their capture id (`cap`) and message id (`msg`) so stale or broken
+   * messages can be skipped as a whole.
    */
   const controlQueue = [], dataQueue = [];
   let pumping = false;
+  let abortedMsg = null;
 
-  function write(bytes, priority = false) {
+  function write(bytes, priority = false, cap = null, msg = null) {
     return new Promise((resolve) => {
-      (priority ? controlQueue : dataQueue).push({ bytes, resolve });
+      (priority ? controlQueue : dataQueue).push({ bytes, resolve, cap, msg });
       pump();
     });
+  }
+
+  function writeOnce(bytes) {
+    const op = mtu >= 64 ? rx.writeValueWithoutResponse(bytes) : rx.writeValueWithResponse(bytes); // long write when MTU is small
+    return Promise.race([op, timeout(WRITE_TIMEOUT_MS)]);
   }
 
   async function pump() {
@@ -194,11 +233,20 @@
     try {
       while (controlQueue.length || dataQueue.length) {
         const item = controlQueue.length ? controlQueue.shift() : dataQueue.shift();
-        if (rx) {
+        const stale = item.cap !== null && item.cap !== activeCap;
+        const broken = item.msg !== null && item.msg === abortedMsg;
+        if (rx && !stale && !broken) {
           try {
-            if (mtu >= 64) await rx.writeValueWithoutResponse(item.bytes);
-            else await rx.writeValueWithResponse(item.bytes); // long write when MTU is small
-          } catch (e) { log('Write failed: ' + e.message); }
+            await writeOnce(item.bytes);
+          } catch (e) {
+            try {
+              await writeOnce(item.bytes); // one retry: the stack may just have been busy
+            } catch (e2) {
+              log('Write failed: ' + e2.message);
+              // A frame missing a chunk can never be reassembled: skip the rest of it.
+              if (item.msg !== null) abortedMsg = item.msg;
+            }
+          }
         }
         item.resolve();
       }
@@ -212,7 +260,7 @@
   // ATT attribute values (and Chrome writes) are limited to 512 bytes regardless of MTU.
   const MAX_ATT_VALUE = 512;
 
-  async function sendMessage(payload) {
+  async function sendMessage(payload, cap) {
     const max = mtu >= 64 ? Math.min(mtu - 3, MAX_ATT_VALUE) : 500;
     const per = max - 7;
     const count = Math.max(1, Math.ceil(payload.length / per));
@@ -223,9 +271,10 @@
       const pkt = new Uint8Array(7 + part.length);
       pkt[0] = CHUNK; u16(pkt, 1, id); u16(pkt, 3, i); u16(pkt, 5, count);
       pkt.set(part, 7);
-      last = write(pkt);
+      last = write(pkt, false, cap, id);
     }
-    return last;
+    await last;
+    return abortedMsg !== id && activeCap === cap;
   }
 
   function captureSize() {
@@ -237,7 +286,7 @@
 
   function sendHello() {
     const [w, h] = captureSize();
-    const p = new Uint8Array(5); p[0] = HELLO; u16(p, 1, w); u16(p, 3, h);
+    const p = new Uint8Array(6); p[0] = HELLO; u16(p, 1, w); u16(p, 3, h); p[5] = PROTOCOL_VERSION;
     write(p, true);
   }
 
@@ -245,15 +294,23 @@
   function sendHeartbeat() {
     if (!rx || heartbeatQueued) return;
     const [w, h] = captureSize();
-    const p = new Uint8Array(6); p[0] = HEARTBEAT; p[1] = track && track.readyState === 'live' ? 1 : 0;
-    u16(p, 2, w); u16(p, 4, h);
+    const p = new Uint8Array(7); p[0] = HEARTBEAT; p[1] = track && track.readyState === 'live' ? 1 : 0;
+    u16(p, 2, w); u16(p, 4, h); p[6] = PROTOCOL_VERSION;
     heartbeatQueued = true;
     write(p, true).then(() => { heartbeatQueued = false; });
   }
 
   // Timers in a worker aren't throttled when this tab is in the background behind the game.
   const worker = new Worker(URL.createObjectURL(new Blob(['setInterval(() => postMessage(0), 1000);'], { type: 'text/javascript' })));
-  worker.onmessage = sendHeartbeat;
+  let tickWaiters = [];
+  worker.onmessage = () => {
+    sendHeartbeat();
+    const ready = tickWaiters.filter(w => --w.n <= 0);
+    tickWaiters = tickWaiters.filter(w => w.n > 0);
+    ready.forEach(w => w.resolve());
+  };
+  /** Resolves after `n` worker ticks (about n seconds), even in a hidden tab. */
+  const waitTicks = (n) => new Promise(resolve => tickWaiters.push({ n, resolve }));
 
   // ---------------------------------------------------------------- Capture
 
@@ -261,7 +318,8 @@
     if (track) { stopSharing(); return; }
     try {
       stream = await navigator.mediaDevices.getDisplayMedia({
-        video: { cursor: 'always', frameRate: { ideal: 15, max: 30 } },
+        // 30 fps so a capture taken ~50ms after a cursor nudge already shows the nudge.
+        video: { cursor: 'always', frameRate: { ideal: 30, max: 30 } },
         audio: false,
         selfBrowserSurface: 'exclude',
         surfaceSwitching: 'include',
@@ -335,7 +393,13 @@
 
   /** Returns {src, w, h, own}; `own` sources must be closed after drawing. */
   async function grab() {
-    if (latestFrame) return { src: latestFrame, w: latestFrame.displayWidth, h: latestFrame.displayHeight, own: false };
+    // Clone so the reader loop can't close the frame while we're still drawing it.
+    if (latestFrame) {
+      try {
+        const f = latestFrame.clone();
+        return { src: f, w: f.displayWidth, h: f.displayHeight, own: true };
+      } catch (e) { /* closed under us; fall through */ }
+    }
     if (imageCapture) {
       try {
         const bmp = await Promise.race([imageCapture.grabFrame(), timeout(700)]);
@@ -353,9 +417,11 @@
     const started = performance.now();
     const header = new Uint8Array(15);
     u16(header, 0, m.id);
+    const stale = () => activeCap !== m.id;
     try {
       if (!track || track.readyState !== 'live') throw new Error('Not sharing a window');
       const frame = await grab();
+      if (stale()) { if (frame.own) frame.src.close(); return; }
       const vw = frame.w, vh = frame.h;
       const sx = Math.max(0, Math.min(vw - 1, Math.round(m.x * vw)));
       const sy = Math.max(0, Math.min(vh - 1, Math.round(m.y * vh)));
@@ -372,12 +438,13 @@
       const quality = typeof m.q === 'number' ? m.q : 0.85;
       const blob = await work.convertToBlob(png ? { type: 'image/png' } : { type: 'image/jpeg', quality });
       const img = new Uint8Array(await blob.arrayBuffer());
+      if (stale()) return;
       u16(header, 2, vw); u16(header, 4, vh);
       u16(header, 6, sx); u16(header, 8, sy); u16(header, 10, sw); u16(header, 12, sh);
       header[14] = png ? FMT_PNG : FMT_JPEG;
       const payload = new Uint8Array(header.length + img.length);
       payload.set(header); payload.set(img, header.length);
-      await sendMessage(payload);
+      if (!await sendMessage(payload, m.id)) { log('Capture ' + m.id + ' dropped (cancelled or link error)'); return; }
       captures++;
       $('sCount').textContent = captures;
       $('sSize').textContent = (img.length / 1024).toFixed(1) + ' KB';
@@ -388,7 +455,7 @@
       const msg = new TextEncoder().encode(e.message || String(e));
       const payload = new Uint8Array(header.length + msg.length);
       payload.set(header); payload.set(msg, header.length);
-      sendMessage(payload);
+      if (!stale()) sendMessage(payload, m.id);
       log('Capture failed: ' + e.message);
     }
   }
