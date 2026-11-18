@@ -189,8 +189,11 @@
 
   function u16(arr, at, v) { arr[at] = v & 0xff; arr[at + 1] = (v >> 8) & 0xff; }
 
+  // ATT attribute values (and Chrome writes) are limited to 512 bytes regardless of MTU.
+  const MAX_ATT_VALUE = 512;
+
   async function sendMessage(payload) {
-    const max = mtu >= 64 ? mtu - 3 : 500;
+    const max = mtu >= 64 ? Math.min(mtu - 3, MAX_ATT_VALUE) : 500;
     const per = max - 7;
     const count = Math.max(1, Math.ceil(payload.length / per));
     const id = msgId = (msgId % 65535) + 1;
