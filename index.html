@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Slimy Companion</title>
+<style>
+  :root {
+    --bg: #f6f8f5; --card: #ffffff; --text: #1b1f1b; --muted: #5d665d; --line: #dfe5dd;
+    --accent: #2e7d32; --accent-text: #ffffff; --warn: #b3261e; --ok: #2e7d32;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #101410; --card: #1a201a; --text: #e3e8e2; --muted: #9aa59a; --line: #2c352c;
+            --accent: #8bd58e; --accent-text: #0b200c; --warn: #ffb4ab; --ok: #8bd58e; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 24px 16px 48px; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  p.sub { margin: 0 0 20px; color: var(--muted); }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 16px; margin-bottom: 14px; }
+  .step { display: flex; gap: 14px; align-items: center; flex-wrap: wrap; }
+  .num { width: 28px; height: 28px; border-radius: 50%; background: var(--line); display: grid; place-items: center; font-weight: 600; flex: none; }
+  .step.done .num { background: var(--accent); color: var(--accent-text); }
+  .grow { flex: 1; min-width: 200px; }
+  .title { font-weight: 600; }
+  .status { color: var(--muted); font-size: 14px; }
+  .status.ok { color: var(--ok); }
+  .status.err { color: var(--warn); }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 999px; padding: 9px 18px; cursor: pointer;
+           background: var(--accent); color: var(--accent-text); }
+  button.secondary { background: transparent; color: var(--text); border: 1px solid var(--line); }
+  button:disabled { opacity: .45; cursor: default; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+  .stat .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+  .stat .v { font-size: 18px; font-weight: 600; }
+  canvas#preview { max-width: 100%; border-radius: 8px; border: 1px solid var(--line); display: none; margin-top: 10px; image-rendering: pixelated; }
+  #log { font: 12px/1.5 ui-monospace, Consolas, monospace; color: var(--muted); max-height: 180px; overflow: auto; white-space: pre-wrap; margin: 0; }
+  .note { font-size: 13px; color: var(--muted); }
+  .unsupported { border-color: var(--warn); color: var(--warn); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Slimy Companion</h1>
+  <p class="sub">Lets the Slimy app on your phone read regions of a window on this computer over Bluetooth. Nothing is installed; close this tab to stop.</p>
+
+  <div id="unsupported" class="card unsupported" hidden>
+    This browser doesn't support Web Bluetooth. Use Google Chrome or Microsoft Edge on Windows, macOS or ChromeOS, and open this page over https.
+  </div>
+
+  <div class="card step" id="step1">
+    <div class="num">1</div>
+    <div class="grow">
+      <div class="title">Connect your phone</div>
+      <div class="status" id="btStatus">In Slimy, open Screen OCR and turn it on, then click Connect.</div>
+    </div>
+    <button id="connectBtn">Connect</button>
+  </div>
+
+  <div class="card step" id="step2">
+    <div class="num">2</div>
+    <div class="grow">
+      <div class="title">Share the game window</div>
+      <div class="status" id="shareStatus">Pick the game's window (not the whole screen) for best results.</div>
+    </div>
+    <button id="shareBtn">Share window</button>
+  </div>
+
+  <div class="card">
+    <div class="stats">
+      <div class="stat"><div class="k">Captures sent</div><div class="v" id="sCount">0</div></div>
+      <div class="stat"><div class="k">Last size</div><div class="v" id="sSize">–</div></div>
+      <div class="stat"><div class="k">Last send time</div><div class="v" id="sTime">–</div></div>
+      <div class="stat"><div class="k">Link MTU</div><div class="v" id="sMtu">–</div></div>
+    </div>
+    <canvas id="preview"></canvas>
+  </div>
+
+  <div class="card">
+    <div class="title" style="margin-bottom:6px">Log</div>
+    <pre id="log"></pre>
+  </div>
+
+  <p class="note">This page only sends the parts of the shared window that the phone asks for. If the shared window closes, the phone stops the running macro.</p>
+</main>
+
+<script>
+(() => {
+  const SERVICE = '7a5e0001-3c1b-4f6d-9b8e-2d5f51494d59';
+  const TX_UUID = '7a5e0002-3c1b-4f6d-9b8e-2d5f51494d59'; // phone -> page (notify)
+  const RX_UUID = '7a5e0003-3c1b-4f6d-9b8e-2d5f51494d59'; // page -> phone (write)
+  const HELLO = 0x01, HEARTBEAT = 0x02, ENDED = 0x03, CHUNK = 0x10;
+  const FMT_JPEG = 1, FMT_PNG = 2, FMT_ERROR = 3;
+
+  const $ = (id) => document.getElementById(id);
+  const logEl = $('log');
+  function log(msg) {
+    const t = new Date().toLocaleTimeString();
+    logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent.slice(0, 6000);
+  }
+  function setStatus(el, text, cls) { el.textContent = text; el.className = 'status' + (cls ? ' ' + cls : ''); }
+
+  if (!navigator.bluetooth) { $('unsupported').hidden = false; $('connectBtn').disabled = true; }
+
+  let device = null, rx = null, tx = null;
+  let mtu = 23;
+  let stream = null, track = null, video = null, imageCapture = null;
+  let msgId = 1, captures = 0;
+  let incoming = [];
+  let writeChain = Promise.resolve();
+  let manualDisconnect = false;
+
+  // ---------------------------------------------------------------- Bluetooth
+
+  async function connect() {
+    try {
+      manualDisconnect = false;
+      device = await navigator.bluetooth.requestDevice({ filters: [{ services: [SERVICE] }] });
+      device.addEventListener('gattserverdisconnected', onDisconnected);
+      await openGatt();
+    } catch (e) {
+      setStatus($('btStatus'), e.message || String(e), 'err');
+      log('Connect failed: ' + e);
+    }
+  }
+
+  async function openGatt() {
+    setStatus($('btStatus'), 'Connecting…');
+    const server = await device.gatt.connect();
+    const svc = await server.getPrimaryService(SERVICE);
+    tx = await svc.getCharacteristic(TX_UUID);
+    rx = await svc.getCharacteristic(RX_UUID);
+    tx.addEventListener('characteristicvaluechanged', onNotify);
+    await tx.startNotifications();
+    setStatus($('btStatus'), 'Connected to ' + (device.name || 'phone'), 'ok');
+    $('step1').classList.add('done');
+    $('connectBtn').textContent = 'Disconnect';
+    log('Connected');
+    if (track) sendHello();
+  }
+
+  async function onDisconnected() {
+    rx = tx = null;
+    $('step1').classList.remove('done');
+    $('connectBtn').textContent = 'Connect';
+    if (manualDisconnect) { setStatus($('btStatus'), 'Disconnected'); return; }
+    setStatus($('btStatus'), 'Connection lost. Reconnecting…', 'err');
+    log('Disconnected; retrying');
+    for (let i = 0; i < 5 && device && !manualDisconnect; i++) {
+      await new Promise(r => setTimeout(r, 1500 * (i + 1)));
+      try { await openGatt(); return; } catch (e) { log('Retry failed: ' + e.message); }
+    }
+    setStatus($('btStatus'), 'Disconnected. Click Connect to try again.', 'err');
+  }
+
+  function onNotify(ev) {
+    const bytes = new Uint8Array(ev.target.value.buffer.slice(ev.target.value.byteOffset, ev.target.value.byteOffset + ev.target.value.byteLength));
+    if (!bytes.length) return;
+    incoming.push(bytes.slice(1));
+    if (bytes[0] & 1) {
+      const total = incoming.reduce((n, p) => n + p.length, 0);
+      const all = new Uint8Array(total);
+      let pos = 0;
+      for (const p of incoming) { all.set(p, pos); pos += p.length; }
+      incoming = [];
+      let msg;
+      try { msg = JSON.parse(new TextDecoder().decode(all)); } catch (e) { log('Bad message'); return; }
+      handleMessage(msg);
+    }
+  }
+
+  function handleMessage(m) {
+    if (m.t === 'mtu') { mtu = m.v; $('sMtu').textContent = mtu; }
+    else if (m.t === 'cap') { handleCapture(m); }
+  }
+
+  /** Serializes all writes; the phone reassembles chunks in order. */
+  function write(bytes) {
+    writeChain = writeChain.then(async () => {
+      if (!rx) return;
+      try {
+        if (mtu >= 64) await rx.writeValueWithoutResponse(bytes);
+        else await rx.writeValueWithResponse(bytes); // long write when MTU is small
+      } catch (e) { log('Write failed: ' + e.message); throw e; }
+    }).catch(() => {});
+    return writeChain;
+  }
+
+  function u16(arr, at, v) { arr[at] = v & 0xff; arr[at + 1] = (v >> 8) & 0xff; }
+
+  async function sendMessage(payload) {
+    const max = mtu >= 64 ? mtu - 3 : 500;
+    const per = max - 7;
+    const count = Math.max(1, Math.ceil(payload.length / per));
+    const id = msgId = (msgId % 65535) + 1;
+    let last;
+    for (let i = 0; i < count; i++) {
+      const part = payload.subarray(i * per, Math.min(payload.length, (i + 1) * per));
+      const pkt = new Uint8Array(7 + part.length);
+      pkt[0] = CHUNK; u16(pkt, 1, id); u16(pkt, 3, i); u16(pkt, 5, count);
+      pkt.set(part, 7);
+      last = write(pkt);
+    }
+    return last;
+  }
+
+  function captureSize() {
+    if (!track) return [0, 0];
+    const s = track.getSettings();
+    return [s.width || (video && video.videoWidth) || 0, s.height || (video && video.videoHeight) || 0];
+  }
+
+  function sendHello() {
+    const [w, h] = captureSize();
+    const p = new Uint8Array(5); p[0] = HELLO; u16(p, 1, w); u16(p, 3, h);
+    write(p);
+  }
+
+  function sendHeartbeat() {
+    if (!rx) return;
+    const [w, h] = captureSize();
+    const p = new Uint8Array(6); p[0] = HEARTBEAT; p[1] = track && track.readyState === 'live' ? 1 : 0;
+    u16(p, 2, w); u16(p, 4, h);
+    write(p);
+  }
+
+  // Timers in a worker aren't throttled when this tab is in the background behind the game.
+  const worker = new Worker(URL.createObjectURL(new Blob(['setInterval(() => postMessage(0), 1000);'], { type: 'text/javascript' })));
+  worker.onmessage = sendHeartbeat;
+
+  // ---------------------------------------------------------------- Capture
+
+  async function share() {
+    if (track) { stopSharing(); return; }
+    try {
+      stream = await navigator.mediaDevices.getDisplayMedia({
+        video: { cursor: 'always', frameRate: { ideal: 15, max: 30 } },
+        audio: false,
+        selfBrowserSurface: 'exclude',
+        surfaceSwitching: 'include',
+      });
+    } catch (e) {
+      setStatus($('shareStatus'), 'Sharing cancelled', 'err');
+      return;
+    }
+    track = stream.getVideoTracks()[0];
+    track.addEventListener('ended', onEnded);
+    video = document.createElement('video');
+    video.muted = true; video.playsInline = true; video.srcObject = stream;
+    await video.play().catch(() => {});
+    imageCapture = ('ImageCapture' in window) ? new ImageCapture(track) : null;
+    const [w, h] = captureSize();
+    setStatus($('shareStatus'), `Sharing "${track.label || 'window'}" (${w}×${h})`, 'ok');
+    $('step2').classList.add('done');
+    $('shareBtn').textContent = 'Stop sharing';
+    log('Sharing ' + (track.label || 'window'));
+    sendHello();
+  }
+
+  function onEnded() {
+    log('Shared window closed');
+    write(new Uint8Array([ENDED]));
+    cleanupShare();
+    setStatus($('shareStatus'), 'The shared window was closed. Slimy stops macros that need it.', 'err');
+  }
+
+  function stopSharing() {
+    if (track) track.stop();
+    write(new Uint8Array([ENDED]));
+    cleanupShare();
+    setStatus($('shareStatus'), 'Not sharing');
+  }
+
+  function cleanupShare() {
+    track = null; stream = null; imageCapture = null;
+    if (video) { video.srcObject = null; video = null; }
+    $('step2').classList.remove('done');
+    $('shareBtn').textContent = 'Share window';
+  }
+
+  async function grab() {
+    if (imageCapture) {
+      try { return await imageCapture.grabFrame(); } catch (e) { /* fall back to the video element */ }
+    }
+    if (video && video.videoWidth) return video;
+    throw new Error('No frame available yet');
+  }
+
+  const work = new OffscreenCanvas(1, 1);
+  const wctx = work.getContext('2d', { willReadFrequently: false });
+
+  async function handleCapture(m) {
+    const started = performance.now();
+    const header = new Uint8Array(15);
+    u16(header, 0, m.id);
+    try {
+      if (!track || track.readyState !== 'live') throw new Error('Not sharing a window');
+      const frame = await grab();
+      const vw = frame.videoWidth || frame.width, vh = frame.videoHeight || frame.height;
+      const sx = Math.max(0, Math.min(vw - 1, Math.round(m.x * vw)));
+      const sy = Math.max(0, Math.min(vh - 1, Math.round(m.y * vh)));
+      const sw = Math.max(1, Math.min(vw - sx, Math.round(m.w * vw)));
+      const sh = Math.max(1, Math.min(vh - sy, Math.round(m.h * vh)));
+      let ow = sw, oh = sh;
+      if (m.mw > 0 && sw > m.mw) { ow = m.mw; oh = Math.max(1, Math.round(sh * m.mw / sw)); }
+      work.width = ow; work.height = oh;
+      wctx.imageSmoothingQuality = 'high';
+      wctx.drawImage(frame, sx, sy, sw, sh, 0, 0, ow, oh);
+      if (frame.close) frame.close();
+      const png = m.f === 'png';
+      const blob = await work.convertToBlob(png ? { type: 'image/png' } : { type: 'image/jpeg', quality: 0.85 });
+      const img = new Uint8Array(await blob.arrayBuffer());
+      u16(header, 2, vw); u16(header, 4, vh);
+      u16(header, 6, sx); u16(header, 8, sy); u16(header, 10, sw); u16(header, 12, sh);
+      header[14] = png ? FMT_PNG : FMT_JPEG;
+      const payload = new Uint8Array(header.length + img.length);
+      payload.set(header); payload.set(img, header.length);
+      await sendMessage(payload);
+      captures++;
+      $('sCount').textContent = captures;
+      $('sSize').textContent = (img.length / 1024).toFixed(1) + ' KB';
+      $('sTime').textContent = Math.round(performance.now() - started) + ' ms';
+      showPreview(ow, oh);
+    } catch (e) {
+      header[14] = FMT_ERROR;
+      const msg = new TextEncoder().encode(e.message || String(e));
+      const payload = new Uint8Array(header.length + msg.length);
+      payload.set(header); payload.set(msg, header.length);
+      sendMessage(payload);
+      log('Capture failed: ' + e.message);
+    }
+  }
+
+  let previewPending = false;
+  function showPreview(w, h) {
+    if (document.hidden || previewPending) return;
+    previewPending = true;
+    requestAnimationFrame(() => {
+      previewPending = false;
+      const c = $('preview');
+      c.width = w; c.height = h;
+      c.getContext('2d').drawImage(work, 0, 0);
+      c.style.display = 'block';
+    });
+  }
+
+  $('connectBtn').addEventListener('click', () => {
+    if (device && device.gatt.connected) { manualDisconnect = true; device.gatt.disconnect(); }
+    else connect();
+  });
+  $('shareBtn').addEventListener('click', share);
+  window.addEventListener('beforeunload', () => { if (track) write(new Uint8Array([ENDED])); });
+})();
+</script>
+</body>
+</html>
