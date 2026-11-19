@@ -93,7 +93,8 @@
   const RX_UUID = '7a5e0003-3c1b-4f6d-9b8e-2d5f51494d59'; // page -> phone (write)
   const HELLO = 0x01, HEARTBEAT = 0x02, ENDED = 0x03, CHUNK = 0x10, SIGNAL = 0x20;
   const FMT_JPEG = 1, FMT_PNG = 2, FMT_ERROR = 3;
-  const PROTOCOL_VERSION = 3;
+  const PROTOCOL_VERSION = 4; // 4: frame age (ag) + fresh-frame requests (fr)
+  const FMT_HAS_AGE = 0x80, AGE_UNKNOWN = 0xFFFF, MAX_FRESH_WAIT_MS = 1000;
   const RTC_CHUNK = 64 * 1024; // largest DataChannel message we send
   const FLAG_LAST = 1, FLAG_FIRST = 2;
   const WRITE_TIMEOUT_MS = 2000;
@@ -488,6 +489,10 @@
    * waiting for "the next frame" can hang on a static window like Notepad.
    */
   let latestFrame = null, frameReader = null;
+  /** performance.now() when latestFrame arrived; 0 = no frame reader (age unknown). */
+  let latestAt = 0;
+  /** Resolvers waiting for the next frame (fresh-frame requests). */
+  let frameWaiters = [];
   function startFrameReader() {
     if (!('MediaStreamTrackProcessor' in window)) return;
     try {
@@ -501,10 +506,38 @@
           if (done) break;
           if (latestFrame) latestFrame.close();
           latestFrame = value;
+          latestAt = performance.now();
+          if (frameWaiters.length) frameWaiters.splice(0).forEach(r => r());
         }
       } catch (e) { /* stream ended */ }
     })();
   }
+
+  /**
+   * Waits for a frame that arrived after `since`, up to `maxWait` ms. The phone asks for this right
+   * after sending input, so the capture shows its effect. A static window only produces frames when
+   * it changes, so if none comes the latest frame is still current.
+   */
+  async function waitFreshFrame(since, maxWait) {
+    if (!frameReader || latestAt > since) return;
+    await new Promise(resolve => {
+      const t = workerTimeout(maxWait, done);
+      function done() { clearWorkerTimeout(t); frameWaiters = frameWaiters.filter(r => r !== done); resolve(); }
+      frameWaiters.push(done);
+    });
+  }
+
+  /*
+   * Short timeouts that still fire on time in a hidden tab (the game is in front, so this tab
+   * usually is): page timers are clamped to 1s or more there, worker timers aren't.
+   */
+  const timerWorker = new Worker(URL.createObjectURL(new Blob(
+    ['onmessage = (e) => setTimeout(() => postMessage(e.data.id), e.data.ms);'], { type: 'text/javascript' })));
+  let timerSeq = 0;
+  const timerCallbacks = new Map();
+  timerWorker.onmessage = (e) => { const cb = timerCallbacks.get(e.data); if (cb) { timerCallbacks.delete(e.data); cb(); } };
+  function workerTimeout(ms, cb) { const id = ++timerSeq; timerCallbacks.set(id, cb); timerWorker.postMessage({ id, ms }); return id; }
+  function clearWorkerTimeout(id) { timerCallbacks.delete(id); }
 
   const timeout = (ms) => new Promise((_, reject) => setTimeout(() => reject(new Error('timeout')), ms));
 
@@ -532,12 +565,22 @@
 
   async function handleCapture(m, via) {
     const started = performance.now();
-    const header = new Uint8Array(15);
+    // v4 phones ask for the frame age (ag); older phones expect the 15-byte header.
+    const withAge = m.ag === 1;
+    const header = new Uint8Array(withAge ? 17 : 15);
     u16(header, 0, m.id);
     const stale = () => activeCap !== m.id;
+    const fmt = (f) => withAge ? (f | FMT_HAS_AGE) : f;
+    if (withAge) u16(header, 15, AGE_UNKNOWN);
     try {
       if (!track || track.readyState !== 'live') throw new Error('Not sharing a window');
+      if (typeof m.fr === 'number' && m.fr > 0) {
+        await waitFreshFrame(started, Math.min(m.fr, MAX_FRESH_WAIT_MS));
+        if (stale()) return;
+      }
+      const usedReader = !!latestFrame;
       const frame = await grab();
+      if (withAge && usedReader && latestAt > 0) u16(header, 15, Math.min(AGE_UNKNOWN - 1, Math.round(performance.now() - latestAt)));
       if (stale()) { if (frame.own) frame.src.close(); return; }
       const vw = frame.w, vh = frame.h;
       const sx = Math.max(0, Math.min(vw - 1, Math.round(m.x * vw)));
@@ -558,7 +601,7 @@
       if (stale()) return;
       u16(header, 2, vw); u16(header, 4, vh);
       u16(header, 6, sx); u16(header, 8, sy); u16(header, 10, sw); u16(header, 12, sh);
-      header[14] = png ? FMT_PNG : FMT_JPEG;
+      header[14] = fmt(png ? FMT_PNG : FMT_JPEG);
       const payload = new Uint8Array(header.length + img.length);
       payload.set(header); payload.set(img, header.length);
       if (!await reply(payload, m.id, via)) { log('Capture ' + m.id + ' dropped (cancelled or link error)'); return; }
@@ -568,7 +611,7 @@
       $('sTime').textContent = Math.round(performance.now() - started) + ' ms';
       showPreview(ow, oh);
     } catch (e) {
-      header[14] = FMT_ERROR;
+      header[14] = fmt(FMT_ERROR);
       const msg = new TextEncoder().encode(e.message || String(e));
       const payload = new Uint8Array(header.length + msg.length);
       payload.set(header); payload.set(msg, header.length);
