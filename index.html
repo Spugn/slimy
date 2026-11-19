@@ -202,7 +202,11 @@
     if (m.t === 'mtu') { mtu = m.v; $('sMtu').textContent = mtu; }
     else if (m.t === 'cap') { activeCap = m.id; handleCapture(m, via); }
     else if (m.t === 'rtc-offer') { onRtcOffer(m); }
-    else if (m.t === 'rtc-close') { closeRtc(); }
+    else if (m.t === 'rtc-close') {
+      if (m.s !== undefined && m.s !== rtcSession) return; // about an older attempt
+      if (m.why) log('Phone gave up on Wi-Fi: ' + m.why + '. Using Bluetooth.');
+      closeRtc();
+    }
     else if (m.t === 'cancel') { if (activeCap === m.id) { activeCap = null; log('Phone cancelled capture ' + m.id); } }
     else if (m.t === 'reset') {
       log('Phone reset the link after lost captures');
@@ -333,12 +337,32 @@
     ]);
   }
 
+  /** "192.168.1.23 (host), …" from an SDP's candidate lines, for the log. */
+  function describeCandidates(sdp) {
+    const seen = new Set();
+    for (const line of (sdp || '').split(/\r?\n/)) {
+      const c = line.match(/^a=candidate:\S+ \d+ (\S+) \d+ (\S+) \d+ typ (\S+)/i);
+      if (c) seen.add(c[2] + ' ' + c[1].toLowerCase() + ' (' + c[3] + ')');
+    }
+    return seen.size ? [...seen].join(', ') : 'none';
+  }
+
   async function onRtcOffer(m) {
     closeRtc();
     if (!('RTCPeerConnection' in window)) { sendSignal({ t: 'closed', s: m.s }); return; }
     const session = m.s;
     rtcSession = session;
+    log('Phone offered Wi-Fi addresses: ' + describeCandidates(m.sdp));
     const conn = pc = new RTCPeerConnection({ iceServers: [] });
+    conn.oniceconnectionstatechange = () => {
+      if (pc !== conn) return;
+      const s = conn.iceConnectionState;
+      log('Wi-Fi link: ' + s);
+      if (s === 'failed') {
+        log('No path between this computer and the phone. Check both are on the same network and subnet '
+          + '(not a guest network, and the router has no "AP/client isolation"), and that a VPN or firewall isn\'t blocking local UDP.');
+      }
+    };
     conn.ondatachannel = (ev) => {
       const ch = ev.channel;
       ch.binaryType = 'arraybuffer';
@@ -360,7 +384,7 @@
       await waitGathering(conn);
       if (rtcSession !== session) return;
       sendSignal({ t: 'answer', s: session, sdp: conn.localDescription.sdp });
-      log('Trying a direct Wi-Fi link…');
+      log('Trying a direct Wi-Fi link… (this computer: ' + describeCandidates(conn.localDescription.sdp) + ')');
     } catch (e) {
       log('Wi-Fi link setup failed: ' + (e.message || e));
       if (rtcSession === session) { sendSignal({ t: 'closed', s: session }); closeRtc(); }
