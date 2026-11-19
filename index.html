@@ -159,42 +159,46 @@
     if (track) sendHello();
   }
 
-  let reconnecting = false;
-
+  /*
+   * Losing the phone (Bluetooth, or an open Wi-Fi link) ends the session: stop sharing the game
+   * window and disconnect, rather than quietly reconnecting. Click Connect to start again.
+   */
   async function onDisconnected() {
     rx = tx = null;
     resetLink();
-    closeRtc(); // signaling rides on Bluetooth; the phone renegotiates after reconnecting
+    closeRtc();
     $('step1').classList.remove('done');
     $('connectBtn').textContent = 'Connect';
+    if (track) {
+      track.stop();
+      cleanupShare();
+      setStatus($('shareStatus'), 'Stopped sharing: the phone disconnected', 'err');
+    }
     if (manualDisconnect) { setStatus($('btStatus'), 'Disconnected'); return; }
-    // A failed attempt fires this event again; the running loop already handles it.
-    if (reconnecting) return;
-    reconnecting = true;
-    setStatus($('btStatus'), 'Connection lost. Reconnecting…', 'err');
-    log('Disconnected; retrying');
-    const dev = device;
+    setStatus($('btStatus'), 'Connection to the phone was lost. Click Connect to start again.', 'err');
+    log('Bluetooth link lost; disconnected and stopped sharing');
+  }
+
+  /** An open Wi-Fi link dropped: tell the phone sharing ended (over Bluetooth), then disconnect. */
+  let endingSession = false;
+  async function onWifiLost() {
+    if (endingSession) return;
+    endingSession = true;
     try {
-      // Backoff 2, 4, 6, 8, then every 10 s: about 3 minutes in all, enough for the phone
-      // to come back after Screen OCR is toggled or Bluetooth restarts.
-      for (let i = 0; i < 20 && device === dev && !manualDisconnect; i++) {
-        // Worker ticks, not setTimeout: a hidden tab throttles timers to once a minute.
-        await waitTicks(Math.min(2 * (i + 1), 10));
-        if (device !== dev || manualDisconnect) return;
-        if (dev.gatt.connected && rx) return; // reconnected some other way
-        try {
-          await openGatt();
-          return;
-        } catch (e) {
-          log(`Retry ${i + 1} failed: ${e.message}`);
-          setStatus($('btStatus'), `Connection lost. Reconnecting (attempt ${i + 2})…`, 'err');
-        }
+      log('Wi-Fi link lost; disconnecting and stopping sharing');
+      if (track) {
+        track.stop();
+        if (rx) await Promise.race([write(new Uint8Array([ENDED]), true), waitTicks(2)]);
+        cleanupShare();
+        setStatus($('shareStatus'), 'Stopped sharing: the Wi-Fi link to the phone was lost', 'err');
       }
-      if (device === dev && !manualDisconnect) {
-        setStatus($('btStatus'), 'Disconnected. Click Connect to try again.', 'err');
+      if (device && device.gatt.connected) {
+        manualDisconnect = true;
+        device.gatt.disconnect();
       }
+      setStatus($('btStatus'), 'Wi-Fi link to the phone was lost. Click Connect to start again.', 'err');
     } finally {
-      reconnecting = false;
+      endingSession = false;
     }
   }
 
@@ -433,7 +437,9 @@
       const ch = ev.channel;
       ch.binaryType = 'arraybuffer';
       ch.onopen = () => { if (pc === conn) { dc = ch; updateLink(); log('Wi-Fi link open'); } };
-      ch.onclose = () => { if (dc === ch) { dc = null; updateLink(); log('Wi-Fi link closed; using Bluetooth'); } };
+      // Only an open link closing on its own counts; closeRtc() clears dc first, so
+      // renegotiation and our own teardown don't land here.
+      ch.onclose = () => { if (dc === ch) { dc = null; updateLink(); onWifiLost(); } };
       ch.onmessage = (e) => {
         if (typeof e.data !== 'string') return;
         let msg;
@@ -442,7 +448,11 @@
       };
     };
     conn.onconnectionstatechange = () => {
-      if (pc === conn && (conn.connectionState === 'failed' || conn.connectionState === 'closed')) closeRtc();
+      if (pc === conn && (conn.connectionState === 'failed' || conn.connectionState === 'closed')) {
+        const wasOpen = dc !== null;
+        closeRtc();
+        if (wasOpen) onWifiLost();
+      }
     };
     try {
       await conn.setRemoteDescription({ type: 'offer', sdp: m.sdp });
