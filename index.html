@@ -132,12 +132,25 @@
 
   async function openGatt() {
     setStatus($('btStatus'), 'Connecting…');
-    const server = await device.gatt.connect();
-    const svc = await server.getPrimaryService(SERVICE);
-    tx = await svc.getCharacteristic(TX_UUID);
-    rx = await svc.getCharacteristic(RX_UUID);
-    tx.addEventListener('characteristicvaluechanged', onNotify);
-    await tx.startNotifications();
+    let t, r;
+    try {
+      const server = await device.gatt.connect();
+      // The link can drop again right after connect() resolves (the phone's stack is still
+      // settling): give it a moment, and reconnect if it already went away.
+      // (A worker tick bounds the wait in a hidden tab, where setTimeout is throttled.)
+      await Promise.race([new Promise(res => setTimeout(res, 300)), waitTicks(1)]);
+      if (!device.gatt.connected) throw new Error('Link dropped right after connecting');
+      const svc = await server.getPrimaryService(SERVICE);
+      t = await svc.getCharacteristic(TX_UUID);
+      r = await svc.getCharacteristic(RX_UUID);
+      t.addEventListener('characteristicvaluechanged', onNotify);
+      await t.startNotifications();
+    } catch (e) {
+      // Clear any half-open connection so the next attempt starts clean.
+      try { if (device.gatt.connected) device.gatt.disconnect(); } catch (_) {}
+      throw e;
+    }
+    tx = t; rx = r;
     setStatus($('btStatus'), 'Connected to ' + (device.name || 'phone'), 'ok');
     $('step1').classList.add('done');
     $('connectBtn').textContent = 'Disconnect';
@@ -146,6 +159,8 @@
     if (track) sendHello();
   }
 
+  let reconnecting = false;
+
   async function onDisconnected() {
     rx = tx = null;
     resetLink();
@@ -153,14 +168,34 @@
     $('step1').classList.remove('done');
     $('connectBtn').textContent = 'Connect';
     if (manualDisconnect) { setStatus($('btStatus'), 'Disconnected'); return; }
+    // A failed attempt fires this event again; the running loop already handles it.
+    if (reconnecting) return;
+    reconnecting = true;
     setStatus($('btStatus'), 'Connection lost. Reconnecting…', 'err');
     log('Disconnected; retrying');
-    for (let i = 0; i < 5 && device && !manualDisconnect; i++) {
-      // Worker ticks, not setTimeout: a hidden tab throttles timers to once a minute.
-      await waitTicks(2 * (i + 1));
-      try { await openGatt(); return; } catch (e) { log('Retry failed: ' + e.message); }
+    const dev = device;
+    try {
+      // Backoff 2, 4, 6, 8, then every 10 s: about 3 minutes in all, enough for the phone
+      // to come back after Screen OCR is toggled or Bluetooth restarts.
+      for (let i = 0; i < 20 && device === dev && !manualDisconnect; i++) {
+        // Worker ticks, not setTimeout: a hidden tab throttles timers to once a minute.
+        await waitTicks(Math.min(2 * (i + 1), 10));
+        if (device !== dev || manualDisconnect) return;
+        if (dev.gatt.connected && rx) return; // reconnected some other way
+        try {
+          await openGatt();
+          return;
+        } catch (e) {
+          log(`Retry ${i + 1} failed: ${e.message}`);
+          setStatus($('btStatus'), `Connection lost. Reconnecting (attempt ${i + 2})…`, 'err');
+        }
+      }
+      if (device === dev && !manualDisconnect) {
+        setStatus($('btStatus'), 'Disconnected. Click Connect to try again.', 'err');
+      }
+    } finally {
+      reconnecting = false;
     }
-    setStatus($('btStatus'), 'Disconnected. Click Connect to try again.', 'err');
   }
 
   /** Forgets everything tied to the current link: queued writes, partial messages, the MTU. */
