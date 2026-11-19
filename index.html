@@ -240,7 +240,9 @@
     else if (m.t === 'rtc-close') {
       if (m.s !== undefined && m.s !== rtcSession) return; // about an older attempt
       if (m.why) log('Phone gave up on Wi-Fi: ' + m.why + '. Using Bluetooth.');
-      closeRtc();
+      const conn = pc;
+      if (conn) logIceStats(conn).finally(() => { if (pc === conn) closeRtc(); });
+      else closeRtc();
     }
     else if (m.t === 'cancel') { if (activeCap === m.id) { activeCap = null; log('Phone cancelled capture ' + m.id); } }
     else if (m.t === 'reset') {
@@ -382,6 +384,34 @@
     return seen.size ? [...seen].join(', ') : 'none';
   }
 
+  /**
+   * Logs what each address pair tried, so a failed link says which direction broke:
+   * checks we sent vs. answers we got, and checks that arrived from the phone.
+   */
+  async function logIceStats(conn) {
+    try {
+      const stats = await conn.getStats();
+      const cands = {};
+      stats.forEach(r => { if (r.type === 'local-candidate' || r.type === 'remote-candidate') cands[r.id] = r; });
+      const where = c => c ? (c.address || c.ip || 'hidden') + ':' + c.port + ' ' + c.candidateType : '?';
+      let sent = 0, answered = 0, fromPhone = 0;
+      const lines = [];
+      stats.forEach(r => {
+        if (r.type !== 'candidate-pair') return;
+        sent += r.requestsSent || 0; answered += r.responsesReceived || 0; fromPhone += r.requestsReceived || 0;
+        lines.push(where(cands[r.localCandidateId]) + ' → ' + where(cands[r.remoteCandidateId]) + ': ' + r.state
+          + ', checks sent ' + (r.requestsSent || 0) + ', answered ' + (r.responsesReceived || 0)
+          + ', checks from phone ' + (r.requestsReceived || 0));
+      });
+      log('Wi-Fi checks: ' + (lines.length ? lines.join(' | ') : 'no address pairs were tried'));
+      if (!lines.length || sent === 0) log('→ This browser never sent anything to the phone. Check the site\'s "Local network access" permission (lock icon → Site settings) and any security software.');
+      else if (answered === 0 && fromPhone === 0) log('→ Checks were sent but nothing came back from the phone: something between them (firewall/antivirus on this computer, router, phone VPN) drops local UDP.');
+      else if (answered === 0) log('→ The phone\'s checks arrive but its answers to ours don\'t: likely a firewall on this computer filtering inbound UDP for Chrome.');
+    } catch (e) {
+      log('Wi-Fi checks: stats unavailable (' + (e.message || e) + ')');
+    }
+  }
+
   async function onRtcOffer(m) {
     closeRtc();
     if (!('RTCPeerConnection' in window)) { sendSignal({ t: 'closed', s: m.s }); return; }
@@ -394,6 +424,7 @@
       const s = conn.iceConnectionState;
       log('Wi-Fi link: ' + s);
       if (s === 'failed') {
+        logIceStats(conn);
         log('No path between this computer and the phone. Check both are on the same network and subnet '
           + '(not a guest network, and the router has no "AP/client isolation"), and that a VPN or firewall isn\'t blocking local UDP.');
       }
